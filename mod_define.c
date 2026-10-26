@@ -15,8 +15,9 @@
  */
 
 /*
-**  mod_define.c - Apache module for configuration defines ($xxx)
+**  mod_define.c - Apache module for configuration defines (~{xxx})
 **
+**  Copyright (c) 2026 Jean-Francois Stenuit
 **  Copyright (c) 2011 W. Kleedorfer <wkleedorfer@gmail.com>
 **  Copyright (c) 2006 Rainer Jung <rainer.jung@kippdata.de>
 **  Copyright (c) 1998-2000 Ralf S. Engelschall <rse@engelschall.com>
@@ -25,8 +26,6 @@
 */
 
 /*
- *  $Id: mod_define.c,v 1.4 2006/10/11 01:28:35 jung Exp $
- *
  *  HISTORY
  *
  *  v1.0: Originally written in December 1998 by
@@ -44,460 +43,344 @@
  *
  *  v2.2: Added file scope to the variables in Feb. 2011
  *        W. Kleedorfer <wkleedorfer@gmail.com>
+ *
+ *  v4.0: Rewritten for Apache 2.4 in October 2026 by
+ *        Jean-Francois Stenuit: DefineStr and ~{xxx} instead of
+ *        Define and ${xxx}, which core httpd 2.4 now uses; global
+ *        variables, last value wins; empty values; limits on nesting
+ *        and on the length of a substituted line
  */
 
 #include "httpd.h"
 #include "http_config.h"
+#include "http_core.h"
 #include "http_log.h"
+#include "http_main.h"
+#include "util_varbuf.h"
 
 #include "apr_strings.h"
 #include "apr_lib.h"
 
 module AP_MODULE_DECLARE_DATA define_module;
 
-/*
- * The global table of defines
- */
+APLOG_USE_MODULE(define);
 
+/*
+ * Default meta characters and limits
+ */
+#define DEFAULT_MC_ESCAPE      '\\'
+#define DEFAULT_MC_DELIM       '~'
+#define DEFAULT_MC_BRACEOPEN   '{'
+#define DEFAULT_MC_BRACECLOSE  '}'
+#define DEFAULT_MAX_RECURSION  200
+#define DEFAULT_MAX_STRING     16000
+
+/*
+ * Module state. It lives as long as the configuration pool and is
+ * reset by DefineCleanup() when the configuration is read again.
+ */
 static apr_table_t *tDefines   = NULL;   /* global table of defines */
-static int    bOnceSeenADefine = FALSE;  /* optimization flag */
+static char cEscape            = DEFAULT_MC_ESCAPE;
+static char cDelim             = DEFAULT_MC_DELIM;
+static char cBraceOpen         = DEFAULT_MC_BRACEOPEN;
+static char cBraceClose        = DEFAULT_MC_BRACECLOSE;
+static int  nMaxRecursion      = DEFAULT_MAX_RECURSION;
+static int  nMaxString         = DEFAULT_MAX_STRING;
 
 /*
- * Forward declaration
- */
-static int   DefineIndex      (apr_pool_t *, const char *, char *, int *, int *, char **);
-static char *DefineFetch      (apr_pool_t *, const char *, char *);
-static char *DefineExpand     (apr_pool_t *, char *, int, char *);
-static void  DefineInit       (apr_pool_t *);
-static apr_status_t  DefineCleanup (void *);
-static int   DefineRewriteHook(apr_pool_t *pconf, apr_pool_t *plog,
-                               ap_directive_t *current);
-static int   DefineWalkConfigSub(apr_pool_t *pconf, apr_pool_t *plog,
-                                 ap_directive_t *current);
-static int   DefineWalkConfig(apr_pool_t *pconf, apr_pool_t *plog,
-                              apr_pool_t *ptemp);
-
-/*
- * Character classes for scanner function
+ * Scanner states for DefineExpand()
  */
 typedef enum {
-    CC_ESCAPE, CC_DOLLAR, CC_BRACEOPEN, CC_BRACECLOSE,
-    CC_IDCHAR1, CC_IDCHAR, CC_OTHER, CC_EOS
-} CharClass;
-
-/*
- * Scanner states for scanner function
- */
-typedef enum {
-    SS_NONE, SS_SKIP, SS_DOLLAR, SS_TOKEN_BRACED,
-    SS_TOKEN_UNBRACED, SS_ERROR, SS_FOUND
+    SS_NONE, SS_SKIP, SS_DELIM
 } ScanState;
 
 /*
- * Default meta characters
+ * Characters allowed in a variable name
  */
-#define DEFAULT_MC_ESCAPE      "\\"
-#define DEFAULT_MC_DOLLAR      "$"
-#define DEFAULT_MC_BRACEOPEN   "{"
-#define DEFAULT_MC_BRACECLOSE  "}"
+static int DefineIsIdChar(char c)
+{
+    return apr_isalnum(c) || c == '_' || c == ':' || c == '-';
+}
 
 /*
- * Scanner for variable constructs $xxx and ${xxx}
+ * Report a reference that is left as it is. These are errors in the
+ * configuration, but not fatal ones: the server still starts.
  */
-static int DefineIndex(apr_pool_t *p, const char *pScope, char *cpLine, int *pos, int *len, char **cpVar)
+static void DefineWarn(apr_pool_t *p, const ap_directive_t *dir,
+                       const char *cpMsg)
 {
-    int rc;
-    char *cp;
-    char *cp2;
-    CharClass cc;
-    char cEscape;
-    char cDefine;
-    char cBraceOpen;
-    char cBraceClose;
-    char *cpError;
-    ScanState s;
+    ap_log_perror(APLOG_MARK, APLOG_ERR, 0, p,
+                  "mod_define: %s, left as it is: %s, line %d",
+                  cpMsg, dir->filename, dir->line_num);
+}
 
-    cEscape = DEFAULT_MC_ESCAPE[0];
-    if ((cp = DefineFetch(p, "mod_define", "escape")) != NULL)
-        cEscape = cp[0];
-    cDefine = DEFAULT_MC_DOLLAR[0];
-    if ((cp = DefineFetch(p, "mod_define", "dollar")) != NULL)
-        cDefine = cp[0];
-    cBraceOpen = DEFAULT_MC_BRACEOPEN[0];
-    if ((cp = DefineFetch(p, "mod_define", "braceopen")) != NULL)
-        cBraceOpen = cp[0];
-    cBraceClose = DEFAULT_MC_BRACECLOSE[0];
-    if ((cp = DefineFetch(p, "mod_define", "braceclose")) != NULL)
-        cBraceClose = cp[0];
+static const char *DefineTooLong(apr_pool_t *p)
+{
+    return apr_psprintf(p, "line longer than %d characters after "
+                        "substitution (see DefineMaxString)", nMaxString);
+}
 
-    rc = 0;
-    *len = 0;
-    cc = CC_OTHER;
-    s = SS_NONE;
-    for (cp = cpLine+(*pos); cc != CC_EOS; cp++) {
-        if (*cp == cEscape)
-            cc = CC_ESCAPE;
-        else if (*cp == cDefine)
-            cc = CC_DOLLAR;
-        else if (*cp == cBraceOpen)
-            cc = CC_BRACEOPEN;
-        else if (*cp == cBraceClose)
-            cc = CC_BRACECLOSE;
-        else if (apr_isalpha(*cp))
-            cc = CC_IDCHAR1;
-        else if (apr_isdigit(*cp) || *cp == '_' || *cp == ':' || *cp == '-')
-            cc = CC_IDCHAR;
-        else if (*cp == '\0')
-            cc = CC_EOS;
-        else
-            cc = CC_OTHER;
+/*
+ * Append cpIn to vb, replacing every ~{name} by the value of name.
+ * A value is expanded the same way before it is inserted, one level
+ * deeper. The escape character protects the character after it; both
+ * are copied as they are. Returns NULL, or a message for an error that
+ * must stop the server.
+ */
+static const char *DefineExpand(apr_pool_t *p, const ap_directive_t *dir,
+                                struct ap_varbuf *vb, const char *cpIn,
+                                int nDepth)
+{
+    const char *cp;
+    const char *cpCopied;   /* start of the text not copied yet */
+    const char *cpName;
+    const char *cpEnd;
+    const char *cpVal;
+    const char *cpError;
+    char *cpVar;
+    ScanState s = SS_NONE;
+
+    cpCopied = cpIn;
+    for (cp = cpIn; *cp != '\0'; cp++) {
         switch (s) {
             case SS_NONE:
-                switch (cc) {
-                    case CC_ESCAPE:
-                        s = SS_SKIP;
-                        break;
-                    case CC_DOLLAR:
-                        s = SS_DOLLAR;
-                        break;
-                    default:
-                        break;
-                }
-                break;
+                if (*cp == cEscape)
+                    s = SS_SKIP;
+                else if (*cp == cDelim)
+                    s = SS_DELIM;
+                continue;
             case SS_SKIP:
                 s = SS_NONE;
                 continue;
-                break;
-            case SS_DOLLAR:
-                switch (cc) {
-                    case CC_BRACEOPEN:
-                        s = SS_TOKEN_BRACED;
-                        *pos = cp-cpLine-1;
-                        (*len) = 2;
-                        *cpVar = cp+1;
-                        break;
-                    case CC_IDCHAR1:
-                        s = SS_TOKEN_UNBRACED;
-                        *pos = cp-cpLine-1;
-                        (*len) = 2;
-                        *cpVar = cp;
-                        break;
-                    case CC_ESCAPE:
-                        s = SS_SKIP;
-                        break;
-                    default:
-                        s = SS_NONE;
-                        break;
-                }
-                break;
-            case SS_TOKEN_BRACED:
-                switch (cc) {
-                    case CC_IDCHAR1:
-                    case CC_IDCHAR:
-                        (*len)++;
-                        break;
-                    case CC_BRACECLOSE:
-                        (*len)++;
-                        cp2 = apr_palloc(p, cp-*cpVar+1);
-                        apr_cpystrn(cp2, *cpVar, cp-*cpVar+1);
-                        *cpVar = cp2;
-                        s = SS_FOUND;
-                        break;
-                    default:
-                        cpError = apr_psprintf(p, "Illegal character '%c' in identifier", *cp);
-                        s = SS_ERROR;
-                        break;
-                }
-                break;
-            case SS_TOKEN_UNBRACED:
-                switch (cc) {
-                    case CC_IDCHAR1:
-                    case CC_IDCHAR:
-                        (*len)++;
-                        break;
-                    default:
-                        cp2 = apr_palloc(p, cp-*cpVar+1);
-                        apr_cpystrn(cp2, *cpVar, cp-*cpVar+1);
-                        *cpVar = cp2;
-                        s = SS_FOUND;
-                        break;
-                }
-                break;
-            case SS_FOUND:
-            case SS_ERROR:
-                break;
+            case SS_DELIM:
+                if (*cp == cEscape)
+                    s = SS_SKIP;
+                else if (*cp != cBraceOpen)
+                    s = SS_NONE;
+                else
+                    break;
+                continue;
         }
-        if (s == SS_ERROR) {
-            fprintf(stderr, "Error: %s\n", cpError);
-            break;
+
+        /* cp is on the brace after the delimiter: read the name */
+        s = SS_NONE;
+        cpName = cp + 1;
+        for (cpEnd = cpName; DefineIsIdChar(*cpEnd); cpEnd++)
+            ;
+        if (*cpEnd != cBraceClose || cpEnd == cpName) {
+            if (*cpEnd == '\0')
+                DefineWarn(p, dir, "unterminated variable reference");
+            else if (*cpEnd == cBraceClose)
+                DefineWarn(p, dir, "empty variable reference");
+            else
+                DefineWarn(p, dir, apr_psprintf(p, "illegal character '%c' "
+                                                "in variable reference",
+                                                *cpEnd));
+            continue;
         }
-        else if (s == SS_FOUND) {
-            rc = 1;
-            break;
+        cpVar = apr_pstrmemdup(p, cpName, cpEnd - cpName);
+        cpVal = tDefines ? apr_table_get(tDefines, cpVar) : NULL;
+        if (cpVal == NULL) {
+            DefineWarn(p, dir, apr_psprintf(p, "variable '%s' not defined",
+                                            cpVar));
+            cp = cpEnd;
+            continue;
         }
+        if (nDepth >= nMaxRecursion)
+            return apr_psprintf(p, "more than %d nested variables while "
+                                "expanding '%s' (does it refer to itself?)",
+                                nMaxRecursion, cpVar);
+
+        /* copy the text before the reference, then the expanded value */
+        ap_varbuf_strmemcat(vb, cpCopied, (int)(cp - 1 - cpCopied));
+        if ((cpError = DefineExpand(p, dir, vb, cpVal, nDepth + 1)) != NULL)
+            return cpError;
+        if (vb->strlen > (apr_size_t)nMaxString)
+            return DefineTooLong(p);
+        cp = cpEnd;
+        cpCopied = cpEnd + 1;
     }
-    return rc;
-}
-
-/*
- * Since mod_define reads all its vars before parsing starts, if you have more than one of each var
- * (i.e. in your VirtualHost files) then only the last one would be used, instead of each define in its
- * own file. to counter this a scope filename::varname is added.
- */
-static char *CreateNewVarName(const char *cpVar, const char *pScope, apr_pool_t *p)
-{
-    int pos = strcspn(cpVar, ":");
-    int varlen = strlen(cpVar);
-
-    // check if ":" is in the varname and there is enough space for a second ":" and at least one char
-    if (pos < (varlen - 2) && cpVar[pos + 1] == ':')
-    {
-	// obviously there is already a scope there
-	pScope = NULL;
-    }
-
-    char *newname; 
-    if (pScope != NULL)
-    {
-        // allocate some memory from the pool
-        // enough so filename::varname (plus trailing zero) fits
-        newname = apr_palloc(p, strlen(cpVar) + strlen(pScope) + 3);
-	strcpy(newname, pScope);
-	strcat(newname, "::");
-	strcat(newname, cpVar);
-    }
-    else
-    {
-        // if there is no filename just keep using the old names
-        newname = apr_palloc(p, strlen(cpVar) + 1);
-	strcpy(newname, cpVar);
-    }
-    return newname;
-}
-
-
-/*
- * Determine the value of a variable
- */
-static char *DefineFetch(apr_pool_t *p, const char *pScope, char *cpVar)
-{
-    char *cpVal;
-    char *cpNewName;
-
-    // check if the scope is available
-    if (pScope != NULL && strlen(pScope) > 0)
-	cpNewName = CreateNewVarName(cpVar, pScope, p);
-    else
-	cpNewName = CreateNewVarName(cpVar, NULL, p);
-
-    /* first try out table */
-    if ((cpVal = (char *)apr_table_get(tDefines, cpNewName)) != NULL)
-        return cpVal;
-    /* second try the environment */
-    if ((cpVal = getenv(cpVar)) != NULL)
-        return cpVal;
+    ap_varbuf_strmemcat(vb, cpCopied, (int)strlen(cpCopied));
+    if (vb->strlen > (apr_size_t)nMaxString)
+        return DefineTooLong(p);
     return NULL;
 }
 
 /*
- * Expand a variable
+ * Substitute the variables in the arguments of every directive of the
+ * tree, sections included. Returns NULL, or a message for an error that
+ * must stop the server.
  */
-static char *DefineExpand(apr_pool_t *p, char *cpToken, int tok_len, char *cpVal)
+static const char *DefineWalkConfig(apr_pool_t *pconf, apr_pool_t *ptemp,
+                                    ap_directive_t *current)
 {
-    char *cp;
-    int val_len, rest_len;
+    struct ap_varbuf vb;
+    const char *cpError;
 
-    val_len  = strlen(cpVal);
-    rest_len = strlen(cpToken+tok_len);
-    if (val_len < tok_len)
-        memcpy(cpToken+val_len, cpToken+tok_len, rest_len+1);
-    else if (val_len > tok_len)
-        for (cp = cpToken+strlen(cpToken); cp > cpToken+tok_len-1; cp--)
-            *(cp+(val_len-tok_len)) = *cp;
-    memcpy(cpToken, cpVal, val_len);
-    return NULL;
-}
-
-/*
- * This routine is called before the server processes the configuration
- * files.
- */
-static int DefineWalkConfig(apr_pool_t *pconf, apr_pool_t *plog,
-                            apr_pool_t *ptemp)
-{
-
-    /* runtime optimization */
-    if (!bOnceSeenADefine)
-        return OK;
-
-    DefineWalkConfigSub(pconf, plog, ap_conftree);
-
-    return OK;
-}
-
-
-/*
- * This routine is called to patch the variables recursively.
- */
-static int DefineWalkConfigSub(apr_pool_t *pconf, apr_pool_t *plog,
-                               ap_directive_t *current)
-{
-
-    /* scan through all directives, executing each one */
-
-    if ( current != NULL ) {
-        DefineRewriteHook(pconf, plog, current);
-        if ( current->first_child != NULL ) {
-            DefineWalkConfigSub(pconf, plog, current->first_child);
+    for (; current != NULL; current = current->next) {
+        if (current->args != NULL && strchr(current->args, cDelim) != NULL) {
+            ap_varbuf_init(ptemp, &vb, strlen(current->args) + 1);
+            cpError = DefineExpand(ptemp, current, &vb, current->args, 0);
+            if (cpError != NULL)
+                return apr_psprintf(pconf, "mod_define: %s: %s, line %d",
+                                    cpError, current->filename,
+                                    current->line_num);
+            if (strcmp(vb.buf, current->args) != 0)
+                current->args = apr_pstrmemdup(pconf, vb.buf, vb.strlen);
+            ap_varbuf_free(&vb);
         }
-        if ( current->next != NULL ) {
-            DefineWalkConfigSub(pconf, plog, current->next);
+        if (current->first_child != NULL) {
+            cpError = DefineWalkConfig(pconf, ptemp, current->first_child);
+            if (cpError != NULL)
+                return cpError;
         }
     }
-
-    return OK;
-}
-
-
-/*
- * This routine is called to patch the variables
- * into one directive.
- */
-static int DefineRewriteHook(apr_pool_t *pconf, apr_pool_t *plog,
-                             ap_directive_t *current)
-{
-
-    char *cpBuf;
-    char *cpLine;
-    int pos;
-    int len;
-    char *cpError;
-    char *cpVar;
-    char *cpVal;
-    const char *pFilename = current?current->filename:NULL;
-
-        /*
-         * Search for:
-         *  ....\$[a-zA-Z][:_a-zA-Z0-9]*....
-         *  ....\${[a-zA-Z][:_a-zA-Z0-9]*}....
-         */
-        cpBuf = NULL;
-        cpLine = (char *)current->args;
-        pos = 0;
-        while (DefineIndex(pconf, pFilename, cpLine, &pos, &len, &cpVar)) {
-
-#ifdef DEFINE_DEBUG
-            {
-            char prefix[1024];
-            char marker[1024];
-            int i;
-            for (i = 0; i < pos; i++)
-                prefix[i] = ' ';
-            prefix[i] = '\0';
-            for (i = 0; i < len; i++)
-                marker[i] = '^';
-            marker[i] = '\0';
-            fprintf(stderr,
-                    "Found variable `%s' (pos: %d, len: %d)\n"
-                    "  %s\n"
-                    "  %s%s\n",
-                    cpVar, pos, len, cpLine, prefix, marker);
-            }
-#endif
-            if (cpBuf == NULL) {
-                cpBuf = apr_palloc(pconf, MAX_STRING_LEN);
-                apr_cpystrn(cpBuf, current->args, MAX_STRING_LEN);
-                cpLine = cpBuf;
-            }
-            if ((cpVal = DefineFetch(pconf, pFilename, cpVar)) == NULL) {
-                ap_log_perror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, plog,
-                             "mod_define: Variable '%s' not defined: file %s, line %d",
-                             cpVar, current->filename,
-                             current->line_num);
-                cpBuf = NULL;
-                break;
-            }
-            if ((cpError = DefineExpand(pconf, cpLine+pos, len, cpVal)) != NULL) {
-                ap_log_perror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, plog,
-                             "mod_define: %s: file %s, line %d",
-                             cpError, current->filename,
-                             current->line_num);
-                cpBuf = NULL;
-                break;
-            }
-        }
-        if ( cpBuf ) {
-            current->args = cpBuf;
-        }
-
-    return OK;
-}
-
-/*
- * Implementation of the `Define' configuration directive
- */
-static const char *cmd_define(cmd_parms *cmd, void *config,
-                              const char *cpVar, const char *cpVal)
-{
-    char *cpNewName = NULL;
-    if (tDefines == NULL)
-        DefineInit(cmd->pool);
-
-    // due to lack of documentation i am not sure when what parameters are actually
-    // valid, so this is me being careful
-    if (cmd != NULL && cmd->config_file != NULL)
-        cpNewName = CreateNewVarName(cpVar, cmd->config_file->name, cmd->pool);
-    else if (cmd != NULL)
-        cpNewName = CreateNewVarName(cpVar, NULL, cmd->pool);
-    else
-	cpNewName = (char*)cpVar;
-
-    apr_table_set(tDefines, cpNewName, cpVal);
-    bOnceSeenADefine = TRUE;
     return NULL;
 }
 
 /*
- * Module Initialization
+ * Called once the whole configuration has been read, before the server
+ * processes it: the values are final, so they apply everywhere.
  */
-
-static void DefineInit(apr_pool_t *p)
+static int DefinePreConfig(apr_pool_t *pconf, apr_pool_t *plog,
+                           apr_pool_t *ptemp)
 {
-    tDefines = apr_table_make(p, 10);
-    /* predefine delimiters */
-    apr_table_set(tDefines, CreateNewVarName("escape", "mod_define", p), DEFAULT_MC_ESCAPE);
-    apr_table_set(tDefines, "mod_define::dollar", DEFAULT_MC_DOLLAR);
-    apr_table_set(tDefines, "mod_define::open",   DEFAULT_MC_BRACEOPEN);
-    apr_table_set(tDefines, "mod_define::close",  DEFAULT_MC_BRACECLOSE);
-    apr_table_set(tDefines, "mod_define::empty",  "");
-    apr_pool_cleanup_register(p, NULL, DefineCleanup, apr_pool_cleanup_null);
-    return;
+    const char *cpError = NULL;
+
+    if (cEscape == cDelim || cEscape == cBraceOpen || cEscape == cBraceClose
+        || cDelim == cBraceOpen || cDelim == cBraceClose
+        || cBraceOpen == cBraceClose)
+        cpError = "mod_define: the four meta characters must differ";
+    else
+        cpError = DefineWalkConfig(pconf, ptemp, ap_conftree);
+    if (cpError != NULL) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, 0, plog, "%s", cpError);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    return OK;
 }
 
 /*
  * Module Cleanup
  */
-
 static apr_status_t DefineCleanup(void *data)
 {
     /* reset private variables when config pool is cleared */
-    tDefines         = NULL;
-    bOnceSeenADefine = FALSE;
+    tDefines      = NULL;
+    cEscape       = DEFAULT_MC_ESCAPE;
+    cDelim        = DEFAULT_MC_DELIM;
+    cBraceOpen    = DEFAULT_MC_BRACEOPEN;
+    cBraceClose   = DEFAULT_MC_BRACECLOSE;
+    nMaxRecursion = DEFAULT_MAX_RECURSION;
+    nMaxString    = DEFAULT_MAX_STRING;
     return APR_SUCCESS;
+}
+
+/*
+ * Module Initialization, on the first directive of the module
+ */
+static void DefineInit(apr_pool_t *p)
+{
+    if (tDefines != NULL)
+        return;
+    tDefines = apr_table_make(p, 64);
+    apr_pool_cleanup_register(p, NULL, DefineCleanup, apr_pool_cleanup_null);
+}
+
+/*
+ * Implementation of the `DefineStr' configuration directive. The value
+ * is stored as it is: references in it are expanded where it is used.
+ */
+static const char *cmd_definestr(cmd_parms *cmd, void *config,
+                                 const char *cpVar, const char *cpVal)
+{
+    const char *cp;
+
+    if (*cpVar == '\0')
+        return "DefineStr: empty variable name";
+    for (cp = cpVar; *cp != '\0'; cp++)
+        if (!DefineIsIdChar(*cp))
+            return apr_psprintf(cmd->pool, "DefineStr: illegal character "
+                                "'%c' in variable name '%s'", *cp, cpVar);
+    DefineInit(cmd->pool);
+    apr_table_set(tDefines, cpVar, cpVal != NULL ? cpVal : "");
+    return NULL;
+}
+
+/*
+ * Implementation of the `DefineMeta*' directives: cmd->info points to
+ * the meta character to set
+ */
+static const char *cmd_meta(cmd_parms *cmd, void *config, const char *cpArg)
+{
+    if (cpArg[0] == '\0' || cpArg[1] != '\0' || DefineIsIdChar(cpArg[0])
+        || apr_isspace(cpArg[0]))
+        return apr_pstrcat(cmd->pool, cmd->cmd->name, " takes one character, "
+                           "which cannot be a letter, a digit, '_', ':', '-' "
+                           "or a space", NULL);
+    DefineInit(cmd->pool);
+    *(char *)cmd->info = cpArg[0];
+    return NULL;
+}
+
+/*
+ * Implementation of the `DefineMaxRecursion' and `DefineMaxString'
+ * directives: cmd->info points to the limit to set
+ */
+static const char *cmd_limit(cmd_parms *cmd, void *config, const char *cpArg)
+{
+    char *cpEnd;
+    apr_int64_t n;
+
+    n = apr_strtoi64(cpArg, &cpEnd, 10);
+    if (*cpArg == '\0' || *cpEnd != '\0' || n < 1 || n > 100000000)
+        return apr_pstrcat(cmd->pool, cmd->cmd->name, " takes a number "
+                           "between 1 and 100000000", NULL);
+    DefineInit(cmd->pool);
+    *(int *)cmd->info = (int)n;
+    return NULL;
+}
+
+/*
+ * Feature names for <IfDefine>, set when the module is loaded
+ */
+static void DefineAddFeature(const char *cpName)
+{
+    if (ap_server_config_defines == NULL || ap_exists_config_define(cpName))
+        return;
+    *(const char **)apr_array_push(ap_server_config_defines) =
+        apr_pstrdup(ap_server_config_defines->pool, cpName);
 }
 
 /*
  * Module Directive lists
  */
 static const command_rec DefineDirectives[] = {
-    AP_INIT_TAKE2("Define", cmd_define, NULL, RSRC_CONF|ACCESS_CONF|EXEC_ON_READ,
-      "Define a configuration variable"),
+    AP_INIT_TAKE12("DefineStr", cmd_definestr, NULL,
+      RSRC_CONF|ACCESS_CONF|EXEC_ON_READ,
+      "Define a configuration variable (string), referenced as ~{name}"),
+    AP_INIT_TAKE1("DefineMaxRecursion", cmd_limit, &nMaxRecursion,
+      RSRC_CONF|EXEC_ON_READ, "Maximum number of nested variables"),
+    AP_INIT_TAKE1("DefineMaxString", cmd_limit, &nMaxString,
+      RSRC_CONF|EXEC_ON_READ,
+      "Maximum length of a line after substitution"),
+    AP_INIT_TAKE1("DefineMetaEscape", cmd_meta, &cEscape,
+      RSRC_CONF|EXEC_ON_READ, "Escape character (default \\)"),
+    AP_INIT_TAKE1("DefineMetaDelim", cmd_meta, &cDelim,
+      RSRC_CONF|EXEC_ON_READ, "Delimiter character (default ~)"),
+    AP_INIT_TAKE1("DefineMetaBraceOpen", cmd_meta, &cBraceOpen,
+      RSRC_CONF|EXEC_ON_READ, "Opening brace character (default {)"),
+    AP_INIT_TAKE1("DefineMetaBraceClose", cmd_meta, &cBraceClose,
+      RSRC_CONF|EXEC_ON_READ, "Closing brace character (default })"),
     { NULL }
 };
 
 static void define_register_hooks(apr_pool_t *p)
 {
-    ap_hook_pre_config(DefineWalkConfig, NULL, NULL, APR_HOOK_MIDDLE);
+    DefineAddFeature("MODDEFINE_EmptyValue");
+    DefineAddFeature("MODDEFINE_MaxRecursion");
+    DefineAddFeature("MODDEFINE_MaxString");
+    ap_hook_pre_config(DefinePreConfig, NULL, NULL, APR_HOOK_REALLY_FIRST);
 }
 
 module AP_MODULE_DECLARE_DATA define_module = {
