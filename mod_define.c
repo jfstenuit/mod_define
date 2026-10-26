@@ -121,15 +121,38 @@ static const char *DefineTooLong(apr_pool_t *p)
 }
 
 /*
+ * The variables being expanded, innermost first, for loop detection
+ * and messages
+ */
+typedef struct DefineChain {
+    const char *cpVar;
+    const struct DefineChain *pOuter;
+} DefineChain;
+
+/*
+ * Format the chain outermost first, ending with cpLast: "a -> b -> c"
+ */
+static const char *DefineChainText(apr_pool_t *p, const DefineChain *pChain,
+                                   const char *cpLast)
+{
+    const char *cpText = cpLast;
+
+    for (; pChain != NULL; pChain = pChain->pOuter)
+        cpText = apr_pstrcat(p, pChain->cpVar, " -> ", cpText, NULL);
+    return cpText;
+}
+
+/*
  * Append cpIn to vb, replacing every ~{name} by the value of name.
  * A value is expanded the same way before it is inserted, one level
- * deeper. The escape character protects the character after it; both
- * are copied as they are. Returns NULL, or a message for an error that
+ * deeper; pChain holds the variables whose values are being expanded.
+ * The escape character protects the character after it; both are
+ * copied as they are. Returns NULL, or a message for an error that
  * must stop the server.
  */
 static const char *DefineExpand(apr_pool_t *p, const ap_directive_t *dir,
                                 struct ap_varbuf *vb, const char *cpIn,
-                                int nDepth)
+                                const DefineChain *pChain, int nDepth)
 {
     const char *cp;
     const char *cpCopied;   /* start of the text not copied yet */
@@ -137,6 +160,8 @@ static const char *DefineExpand(apr_pool_t *p, const ap_directive_t *dir,
     const char *cpEnd;
     const char *cpVal;
     const char *cpError;
+    const DefineChain *pLink;
+    DefineChain link;
     char *cpVar;
     ScanState s = SS_NONE;
 
@@ -186,14 +211,21 @@ static const char *DefineExpand(apr_pool_t *p, const ap_directive_t *dir,
             cp = cpEnd;
             continue;
         }
+        for (pLink = pChain; pLink != NULL; pLink = pLink->pOuter)
+            if (ap_cstr_casecmp(pLink->cpVar, cpVar) == 0)
+                return apr_psprintf(p, "variable '%s' refers to itself: %s",
+                                    cpVar, DefineChainText(p, pChain, cpVar));
         if (nDepth >= nMaxRecursion)
-            return apr_psprintf(p, "more than %d nested variables while "
-                                "expanding '%s' (does it refer to itself?)",
-                                nMaxRecursion, cpVar);
+            return apr_psprintf(p, "more than %d nested variables: %s",
+                                nMaxRecursion,
+                                DefineChainText(p, pChain, cpVar));
 
         /* copy the text before the reference, then the expanded value */
         ap_varbuf_strmemcat(vb, cpCopied, (int)(cp - 1 - cpCopied));
-        if ((cpError = DefineExpand(p, dir, vb, cpVal, nDepth + 1)) != NULL)
+        link.cpVar = cpVar;
+        link.pOuter = pChain;
+        if ((cpError = DefineExpand(p, dir, vb, cpVal, &link,
+                                    nDepth + 1)) != NULL)
             return cpError;
         if (vb->strlen > (apr_size_t)nMaxString)
             return DefineTooLong(p);
@@ -220,7 +252,8 @@ static const char *DefineWalkConfig(apr_pool_t *pconf, apr_pool_t *ptemp,
     for (; current != NULL; current = current->next) {
         if (current->args != NULL && strchr(current->args, cDelim) != NULL) {
             ap_varbuf_init(ptemp, &vb, strlen(current->args) + 1);
-            cpError = DefineExpand(ptemp, current, &vb, current->args, 0);
+            cpError = DefineExpand(ptemp, current, &vb, current->args,
+                                   NULL, 0);
             if (cpError != NULL)
                 return apr_psprintf(pconf, "mod_define: %s: %s, line %d",
                                     cpError, current->filename,

@@ -138,13 +138,13 @@ DefineStr a v
 ServerAdmin ~{a
 EOF
 
-run_case loop fail 'more than 200 nested variables' <<'EOF'
+run_case loop fail "variable 'a' refers to itself: a -> b -> a" <<'EOF'
 DefineStr a "x~{b}"
 DefineStr b "~{a}"
 ErrorDocument 404 "~{a}"
 EOF
 
-run_case max-recursion fail 'more than 2 nested variables' <<'EOF'
+run_case max-recursion fail 'more than 2 nested variables: a -> b -> c' <<'EOF'
 DefineMaxRecursion 2
 DefineStr a "~{b}"
 DefineStr b "~{c}"

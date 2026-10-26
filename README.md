@@ -95,10 +95,12 @@ macros and sections; the last setting wins.
   reference (`~{}`) or a missing closing brace is reported as an error, with
   the file and line, and the reference is left as it is. httpd still
   starts.
-- More nested variables than `DefineMaxRecursion` (usually a variable that
-  refers to itself), a line longer than `DefineMaxString`, an illegal
-  character in a `DefineStr` name and meta characters that are not all
-  different stop httpd.
+- A variable that refers to itself, directly or through other variables,
+  more nested variables than `DefineMaxRecursion`, a line longer than
+  `DefineMaxString`, an illegal character in a `DefineStr` name and meta
+  characters that are not all different stop httpd. For the first two, the
+  message shows the chain of variables, for example
+  `variable 'a' refers to itself: a -> b -> a`.
 
 ### Feature tests
 
